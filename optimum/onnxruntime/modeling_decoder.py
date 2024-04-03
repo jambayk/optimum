@@ -129,6 +129,7 @@ class ORTModelForCausalLM(ORTModel, GenerationMixin):
         preprocessors: Optional[List] = None,
         generation_config: Optional[GenerationConfig] = None,
         use_cache: Optional[bool] = None,
+        constant_inputs: Optional[Dict[str, torch.Tensor]] = None,
         **kwargs,
     ):
         if use_io_binding is None:
@@ -161,23 +162,33 @@ class ORTModelForCausalLM(ORTModel, GenerationMixin):
         model_type = config.model_type.replace("_", "-")
         if model_type in MODEL_TYPES_REQUIRING_POSITION_IDS and "position_ids" not in self.inputs_names:
             logger.warning(
-                f"ORTModelForCausalLM loaded a legacy ONNX model with no position_ids input, although this input is required for batched generation for the architecture {model_type}. "
-                "We strongly encourage to re-export the model with optimum>=1.14 for position_ids and batched inference support."
+                "ORTModelForCausalLM loaded a legacy ONNX model with no position_ids input, although this input is"
+                f" required for batched generation for the architecture {model_type}. We strongly encourage to"
+                " re-export the model with optimum>=1.14 for position_ids and batched inference support."
             )
 
         if use_cache ^ self.use_cache:
             raise ValueError(
-                f"`use_cache` was set to `{use_cache}` but the loaded model only supports `use_cache={self.use_cache}`. "
-                f"Please load your current model with `use_cache={self.use_cache}` or export the original model "
-                f"once again with `use_cache={use_cache}` when calling the `from_pretrained` method. "
-                "To export your model, simply set `export=True`."
+                f"`use_cache` was set to `{use_cache}` but the loaded model only supports `use_cache={self.use_cache}`."
+                f" Please load your current model with `use_cache={self.use_cache}` or export the original model once"
+                f" again with `use_cache={use_cache}` when calling the `from_pretrained` method. To export your model,"
+                " simply set `export=True`."
             )
 
         if use_io_binding and not use_cache:
             raise ValueError(
-                "The parameters combination use_cache=False, use_io_binding=True is not supported. "
-                "Please either pass use_cache=True, use_io_binding=True (default), or use_cache=False, use_io_binding=False."
+                "The parameters combination use_cache=False, use_io_binding=True is not supported. Please either pass"
+                " use_cache=True, use_io_binding=True (default), or use_cache=False, use_io_binding=False."
             )
+
+        # Constant inputs are inputs that are not expected to change during inference like adapter weights
+        # won't be passed to the model's forward method
+        self.constant_inputs = constant_inputs or {}
+        # TODO: is it worth keeping numpy copies of constant inputs?
+        # if not using IO Binding, we would need to convert them to numpy every forward pass otherwise
+        self._numpy_constant_inputs = {
+            name: value.cpu().detach().numpy() for name, value in self.constant_inputs.items()
+        }
 
     @add_start_docstrings_to_model_forward(
         CAUSALLM_ONNX_MODEL_DOCSTRING.format("batch_size, sequence_length")
@@ -246,8 +257,9 @@ class ORTModelForCausalLM(ORTModel, GenerationMixin):
             io_binding, output_shapes, output_buffers = self._prepare_io_binding(
                 self.model,
                 *model_inputs,
+                *self.constant_inputs.values(),
                 known_output_shapes=known_output_shapes,
-                ordered_input_names=self._ordered_input_names,
+                ordered_input_names=[*self._ordered_input_names, *self.constant_inputs],
             )
 
             if self.device.type == "cpu":
@@ -288,6 +300,8 @@ class ORTModelForCausalLM(ORTModel, GenerationMixin):
 
             if use_cache_branch is not None:
                 inputs["use_cache_branch"] = use_cache_branch.cpu().detach().numpy() if use_torch else use_cache_branch
+
+            inputs.update(self._numpy_constant_inputs)
 
             outputs = self.model.run(None, inputs)
 
@@ -478,7 +492,10 @@ class ORTModelForCausalLM(ORTModel, GenerationMixin):
 
             if file_name == ONNX_DECODER_WITH_PAST_NAME and config.model_type in MODEL_TO_PATCH_FOR_PAST:
                 raise ValueError(
-                    f"ONNX Runtime inference using {ONNX_DECODER_WITH_PAST_NAME} has been deprecated for {config.model_type} architecture. Please re-export your model with optimum>=1.14.0 or set use_cache=False. For details about the deprecation, please refer to https://github.com/huggingface/optimum/releases/tag/v1.14.0."
+                    f"ONNX Runtime inference using {ONNX_DECODER_WITH_PAST_NAME} has been deprecated for"
+                    f" {config.model_type} architecture. Please re-export your model with optimum>=1.14.0 or set"
+                    " use_cache=False. For details about the deprecation, please refer to"
+                    " https://github.com/huggingface/optimum/releases/tag/v1.14.0."
                 )
 
             regular_file_names = []
@@ -487,8 +504,8 @@ class ORTModelForCausalLM(ORTModel, GenerationMixin):
 
             if file_name not in regular_file_names:
                 logger.warning(
-                    f"The ONNX file {file_name} is not a regular name used in optimum.onnxruntime that are {regular_file_names}, the "
-                    f"{cls.__name__} might not behave as expected."
+                    f"The ONNX file {file_name} is not a regular name used in optimum.onnxruntime that are"
+                    f" {regular_file_names}, the {cls.__name__} might not behave as expected."
                 )
 
         model_cache_path, preprocessors = cls._cached_file(
